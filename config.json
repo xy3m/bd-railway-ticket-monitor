@@ -1,0 +1,24 @@
+{
+  "from_city": "Sylhet",
+  "to_city": "Dhaka",
+  "journey_dates": [
+    "26-Sep-2026",
+    "27-Sep-2026"
+  ],
+  "seat_class": "ALL",
+  "check_all_classes": true,
+  "poll_interval_seconds": 2.5,
+  "open_browser_on_alert": true,
+  "email": {
+    "enabled": true,
+    "recipient": "your_email@example.com"
+  },
+  "sound": {
+    "enabled": true,
+    "beep_frequency_hz": 1800,
+    "beep_duration_ms": 300
+  },
+  "toast_notification": {
+    "enabled": true
+  }
+}
