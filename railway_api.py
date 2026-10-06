@@ -42,30 +42,108 @@ class RailwayApiClient:
             headers["X-Device-Key"] = self.ssdk
         return headers
 
+    @staticmethod
+    def is_train_allowed(train_name: str, departure_time: str = "", allowed_trains: Optional[List[str]] = None) -> bool:
+        """
+        Checks if a train matches any of the allowed train patterns.
+        If allowed_trains is empty or contains 'ALL', any train is allowed.
+        """
+        if not allowed_trains:
+            return True
+
+        normalized = [t.strip().upper() for t in allowed_trains if t.strip()]
+        if not normalized or "ALL" in normalized:
+            return True
+
+        t_upper = train_name.upper()
+        dep_upper = str(departure_time).upper()
+
+        for pattern in normalized:
+            # Direct match (e.g. "PARABAT" in "PARABAT EXPRESS (709)")
+            if pattern in t_upper:
+                return True
+
+            # Check individual keywords if full phrase doesn't match directly
+            keywords = [w for w in pattern.split() if len(w) > 3 and not w.isdigit()]
+            if keywords and all(kw in t_upper for kw in keywords):
+                return True
+
+        return False
+
+    @classmethod
+    def matches_rules(
+        cls,
+        train_name: str,
+        departure_time: str,
+        st_class: str,
+        rules: List[Dict[str, Any]],
+        check_all_classes: bool = False
+    ) -> bool:
+        """
+        Evaluates whether a train and seat class matches any of the specified rules.
+        Each rule contains 'trains' (list of train patterns) and 'seat_classes' (list of allowed classes).
+        """
+        if check_all_classes:
+            return any(cls.is_train_allowed(train_name, departure_time, r.get("trains")) for r in rules)
+
+        st_upper = st_class.strip().upper()
+        for r in rules:
+            trains_pattern = r.get("trains", ["ALL"])
+            if cls.is_train_allowed(train_name, departure_time, trains_pattern):
+                classes = [c.strip().upper() for c in r.get("seat_classes", [])]
+                if not classes or "ALL" in classes or "ANY" in classes:
+                    return True
+                if st_upper in classes:
+                    return True
+        return False
+
     def search_trips(
         self,
         from_city: str,
         to_city: str,
         date_of_journey: str,
+        seat_classes: Optional[List[str]] = None,
         seat_class: str = "ALL",
-        check_all_classes: bool = True
+        check_all_classes: bool = False,
+        allowed_trains: Optional[List[str]] = None,
+        rules: Optional[List[Dict[str, Any]]] = None
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
         """
         Queries Shohoz API for available trains.
         Returns:
             - available_matches: list of dicts with trains that have online seats > 0
+                                 matching allowed rules/trains and target seat classes.
             - all_trains: list of dicts summarizing each train found
             - latency_ms: response latency in milliseconds
         """
-        # Shohoz accepts a class param; if ALL or ANY, pass SNIGDHA as default query param
-        query_class = "SNIGDHA" if seat_class.upper() in ["ALL", "ANY", ""] else seat_class
+        # Build effective rules if not directly provided
+        if not rules:
+            effective_classes = seat_classes if seat_classes else ([seat_class] if seat_class not in ["ALL", "ANY", ""] else ["ALL"])
+            rules = [{
+                "trains": allowed_trains or ["ALL"],
+                "seat_classes": effective_classes
+            }]
+
+        # Determine query parameter for class
+        all_classes = []
+        for r in rules:
+            all_classes.extend(r.get("seat_classes", []))
+
+        if "SNIGDHA" in [c.upper() for c in all_classes]:
+            query_class = "SNIGDHA"
+        elif all_classes and all_classes[0].upper() not in ["ALL", "ANY"]:
+            query_class = all_classes[0].upper()
+        elif seat_classes and len(seat_classes) > 0 and seat_classes[0].upper() not in ["ALL", "ANY"]:
+            query_class = seat_classes[0].upper()
+        else:
+            query_class = "SNIGDHA"
+
         params = {
             "from_city": from_city,
             "to_city": to_city,
             "date_of_journey": date_of_journey,
             "seat_class": query_class
         }
-
 
         start_t = time.time()
         try:
@@ -102,7 +180,7 @@ class RailwayApiClient:
         all_trains = []
 
         for train in trains:
-            # Bangladesh Railway API uses 'trip_number' for train name (e.g. 'PARABAT EXPRESS (710)')
+            # Bangladesh Railway API uses 'trip_number' for train name (e.g. 'PARABAT EXPRESS (709)')
             train_name = train.get("trip_number") or train.get("train_name", "Unknown Train")
             departure_time = train.get("departure_date_time", "")
             seat_types = train.get("seat_types", [])
@@ -126,13 +204,8 @@ class RailwayApiClient:
                     "fare": st_fare
                 }
 
-                # Check if this class matches the requested seat_class (or if checking all seats)
-                is_target_class = (
-                    check_all_classes
-                    or seat_class.upper() in ["ALL", "ANY", ""]
-                    or st_class.upper() == seat_class.upper()
-                )
-                if is_target_class and online > 0:
+                # Evaluate against defined rules
+                if online > 0 and self.matches_rules(train_name, departure_time, st_class, rules, check_all_classes):
                     available_matches.append({
                         "train_name": train_name,
                         "departure_time": departure_time,

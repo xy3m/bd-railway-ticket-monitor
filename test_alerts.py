@@ -2,6 +2,14 @@ import json
 import time
 import os
 import sys
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from sound_alert import SoundAlarm
 from notifier import Notifier
 
@@ -47,8 +55,11 @@ def run_test():
             "Test Message": "This is a verification test from your Bangladesh Railway Monitor.",
             "Status": "System is active and monitoring.",
             "Route": f"{config.get('from_city')} -> {config.get('to_city')}",
-            "Dates": ", ".join(config.get("journey_dates", [])),
-            "Target Class": config.get("seat_class")
+            "Targets": "; ".join([
+                f"{t['date']} ({t.get('description', '')})" if t.get("description") else f"{t['date']}"
+                for t in config.get("journey_targets", [])
+            ]) if config.get("journey_targets") else ", ".join(config.get("journey_dates", [])),
+            "Target Classes": ", ".join(config.get("seat_classes", [])) if config.get("seat_classes") else config.get("seat_class", "SNIGDHA, AC_S")
         }
     )
     if success:

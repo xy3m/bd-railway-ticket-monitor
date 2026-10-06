@@ -4,8 +4,97 @@ import sys
 import time
 import random
 import threading
+import re
+import ctypes
+import atexit
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+class WindowsSleepPreventer:
+    """
+    Multi-layer sleep prevention for Windows 10/11 (specifically Modern Standby S0 systems).
+    Layer 1 (Kernel): SetThreadExecutionState with ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED,
+                      and ES_AWAYMODE_REQUIRED to declare the system and display actively in use.
+    Layer 2 (OS Heartbeat): Background thread sending a benign virtual F15 key tap every 30s
+                            (the Caffeine method) to continuously reset the Windows user idle timer.
+    """
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ES_AWAYMODE_REQUIRED = 0x00000040
+    VK_F15 = 0x7E
+    KEYEVENTF_KEYUP = 0x0002
+
+    def __init__(self, interval_seconds: int = 30):
+        self.interval_seconds = interval_seconds
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if sys.platform != "win32":
+            return
+        self._running = True
+        self._apply_state()
+        if not self._thread or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
+            self._thread.start()
+
+    def _apply_state(self):
+        try:
+            flags = (
+                self.ES_CONTINUOUS
+                | self.ES_SYSTEM_REQUIRED
+                | self.ES_DISPLAY_REQUIRED
+                | self.ES_AWAYMODE_REQUIRED
+            )
+            ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        except Exception:
+            pass
+
+    def _heartbeat_worker(self):
+        """Periodically resets the Windows user idle timer to prevent S0 Modern Standby entry."""
+        while self._running:
+            try:
+                self._apply_state()
+                # Send invisible F15 key tap to reset Windows idle timer to 0
+                ctypes.windll.user32.keybd_event(self.VK_F15, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(self.VK_F15, 0, self.KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
+            time.sleep(self.interval_seconds)
+
+    def stop(self):
+        if sys.platform != "win32":
+            return
+        self._running = False
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(self.ES_CONTINUOUS)
+        except Exception:
+            pass
+
+
+_sleep_preventer = WindowsSleepPreventer()
+
+
+def prevent_windows_sleep():
+    """Starts dual-layer sleep prevention."""
+    _sleep_preventer.start()
+
+
+def restore_windows_sleep():
+    """Restores default Windows sleep settings."""
+    _sleep_preventer.stop()
+
+
+# Automatically restore system sleep on process exit
+atexit.register(restore_windows_sleep)
 
 from railway_api import RailwayApiClient, RailwayApiError, TokenExpiredError, RateLimitError
 from sound_alert import SoundAlarm
@@ -41,7 +130,80 @@ def save_session(session_data: Dict[str, str]):
     print(f"\n[OK] Session saved to {SESSION_PATH}.")
 
 
+def try_read_clipboard() -> Optional[str]:
+    """Attempts to read text from system clipboard on Windows using tkinter or PowerShell."""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        text = root.clipboard_get()
+        root.destroy()
+        if text and len(text.strip()) > 20:
+            return text.strip()
+    except Exception:
+        pass
+    try:
+        import subprocess
+        res = subprocess.run(["powershell", "-Command", "Get-Clipboard"], capture_output=True, text=True, timeout=2)
+        if res.stdout and len(res.stdout.strip()) > 20:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def extract_session_from_text(text: str) -> Optional[Dict[str, str]]:
+    """Extracts token, uudid, and ssdk from raw text via JSON or regex."""
+    if not text:
+        return None
+    text = text.strip()
+
+    # 1. Strict JSON parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "token" in parsed:
+            return {
+                "token": str(parsed["token"]).strip(),
+                "uudid": str(parsed.get("uudid", "6f06c9e682494f2657d32e7a588d60eb")).strip(),
+                "ssdk": str(parsed.get("ssdk", "")).strip()
+            }
+    except Exception:
+        pass
+
+    # 2. Regex search for token, uudid, ssdk in multi-line or fragmented pasted text
+    t_match = re.search(r'["\']?token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-\.]+)', text)
+    u_match = re.search(r'["\']?uudid["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-]+)', text)
+    s_match = re.search(r'["\']?ssdk["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-]+)', text)
+
+    if t_match and len(t_match.group(1)) > 30:
+        return {
+            "token": t_match.group(1).strip(),
+            "uudid": u_match.group(1).strip() if u_match else "6f06c9e682494f2657d32e7a588d60eb",
+            "ssdk": s_match.group(1).strip() if s_match else ""
+        }
+
+    # 3. Raw JWT token pasted directly
+    cleaned = text.replace("Bearer ", "").strip()
+    if len(cleaned) > 50 and cleaned.startswith("eyJ"):
+        return {
+            "token": cleaned,
+            "uudid": "6f06c9e682494f2657d32e7a588d60eb",
+            "ssdk": ""
+        }
+
+    return None
+
+
 def prompt_user_for_session() -> Dict[str, str]:
+    # 1. Check if clipboard ALREADY contains valid session JSON
+    clip_text = try_read_clipboard()
+    if clip_text:
+        session_from_clip = extract_session_from_text(clip_text)
+        if session_from_clip:
+            print("\n[OK] Automatically detected session credentials from your clipboard!")
+            save_session(session_from_clip)
+            return session_from_clip
+
     print("\n" + "=" * 76)
     print("                BANGLADESH RAILWAY SESSION SETUP")
     print("=" * 76)
@@ -55,52 +217,48 @@ def prompt_user_for_session() -> Dict[str, str]:
     print("  5. Your session credentials are now in your clipboard!")
     print("=" * 76)
 
+    accumulated = []
+
     while True:
-        print("\nPaste the copied JSON (or paste your Bearer token string), then press Enter:")
-        lines = []
+        # Check clipboard again in case user just copied it
+        clip_text = try_read_clipboard()
+        if clip_text:
+            session_from_clip = extract_session_from_text(clip_text)
+            if session_from_clip:
+                print("\n[OK] Automatically detected session credentials from clipboard!")
+                save_session(session_from_clip)
+                return session_from_clip
+
+        print("\nPaste the copied JSON (or press Enter if copied to clipboard):")
         try:
             line = input().strip()
-            if not line:
-                continue
-            lines.append(line)
-            # If line is JSON start '{', read until matching '}'
-            if line.startswith("{") and not line.endswith("}"):
-                while True:
-                    next_line = input().strip()
-                    lines.append(next_line)
-                    if next_line.endswith("}"):
-                        break
         except (KeyboardInterrupt, EOFError):
             print("\nSetup cancelled.")
             sys.exit(0)
 
-        raw_input = "\n".join(lines).strip()
+        if not line:
+            # Re-check clipboard on Enter
+            clip_text = try_read_clipboard()
+            if clip_text:
+                session_from_clip = extract_session_from_text(clip_text)
+                if session_from_clip:
+                    print("\n[OK] Loaded session credentials from clipboard.")
+                    save_session(session_from_clip)
+                    return session_from_clip
+            continue
 
-        # Try parsing as JSON
-        try:
-            parsed = json.loads(raw_input)
-            if isinstance(parsed, dict) and "token" in parsed and "uudid" in parsed:
-                session_data = {
-                    "token": str(parsed["token"]).strip(),
-                    "uudid": str(parsed["uudid"]).strip(),
-                    "ssdk": str(parsed.get("ssdk", "")).strip()
-                }
-                save_session(session_data)
-                return session_data
-        except Exception:
-            pass
+        accumulated.append(line)
+        combined = "\n".join(accumulated)
 
-        # If user just pasted raw token
-        if len(raw_input) > 30 and (" " not in raw_input or raw_input.startswith("eyJ")):
-            session_data = {
-                "token": raw_input.replace("Bearer ", "").strip(),
-                "uudid": "manual-device-id",
-                "ssdk": ""
-            }
+        # Try parsing accumulated lines
+        session_data = extract_session_from_text(combined) or extract_session_from_text(line)
+        if session_data:
             save_session(session_data)
             return session_data
 
-        print("[!] Input could not be parsed as valid session JSON. Please try again.")
+        if len(accumulated) > 10:
+            accumulated = []
+            print("[!] Could not parse session credentials. Please copy from browser console again.")
 
 
 class RailwayTicketMonitor:
@@ -125,10 +283,28 @@ class RailwayTicketMonitor:
 
         self.from_city = self.config.get("from_city", "Sylhet")
         self.to_city = self.config.get("to_city", "Dhaka")
-        self.dates = self.config.get("journey_dates", ["26-Sep-2026", "27-Sep-2026"])
-        self.seat_class = self.config.get("seat_class", "SNIGDHA")
+        
+        # Load journey targets with per-date train rules
+        self.targets: List[Dict[str, Any]] = self.config.get("journey_targets", [])
+        if not self.targets:
+            legacy_dates = self.config.get("journey_dates", ["11-Oct-2026", "12-Oct-2026"])
+            self.targets = [{"date": d, "trains": ["ALL"]} for d in legacy_dates]
+
+        # Target seat classes (e.g. SNIGDHA, AC_S)
+        if "seat_classes" in self.config and isinstance(self.config["seat_classes"], list):
+            self.seat_classes = [c.strip().upper() for c in self.config["seat_classes"] if c.strip()]
+        elif self.config.get("seat_class"):
+            raw_c = str(self.config.get("seat_class", ""))
+            self.seat_classes = [c.strip().upper() for c in raw_c.split(",") if c.strip()]
+        else:
+            self.seat_classes = ["SNIGDHA", "AC_S"]
+
         self.check_all_classes = self.config.get("check_all_classes", False)
-        self.poll_interval = float(self.config.get("poll_interval_seconds", 1.0))
+        self.poll_interval = float(self.config.get("poll_interval_seconds", 2.5))
+        self.prevent_sleep = bool(self.config.get("prevent_sleep", True))
+
+        if self.prevent_sleep:
+            prevent_windows_sleep()
 
         self.running = True
         self.stats = {
@@ -169,33 +345,76 @@ class RailwayTicketMonitor:
         print("      🚆 BANGLADESH RAILWAY LIVE TICKET MONITOR & ALERT SYSTEM")
         print("=" * 76)
         print(f" Route        : {self.from_city} -> {self.to_city}")
-        print(f" Target Dates : {', '.join(self.dates)}")
-        class_desc = "ALL SEATS (Snigdha, S_Chair, Shovon, AC Berth, AC Chair)" if self.check_all_classes or self.seat_class.upper() == "ALL" else self.seat_class
-        print(f" Target Class : {class_desc}")
+        for idx, t in enumerate(self.targets, 1):
+            if t.get("rules"):
+                rule_strs = []
+                for r in t["rules"]:
+                    tr = "All Trains" if "ALL" in [x.upper() for x in r.get("trains", ["ALL"])] else "/".join(r.get("trains", []))
+                    cl = "/".join(r.get("seat_classes", []))
+                    rule_strs.append(f"{tr} [{cl}]")
+                summary = " + ".join(rule_strs)
+            else:
+                train_list = t.get("trains", ["ALL"])
+                train_desc = "All Trains" if "ALL" in [tr.upper() for tr in train_list] else ", ".join(train_list)
+                summary = f"{train_desc} [{', '.join(self.seat_classes)}]"
+            note = f" ({t['description']})" if t.get("description") else ""
+            print(f" Target #{idx}   : {t['date']} -> {summary}{note}")
+        class_desc = "ALL SEATS" if self.check_all_classes else ", ".join(self.seat_classes)
+        print(f" Monitored Cls: {class_desc}")
         print(f" Interval     : {self.poll_interval:.1f} second(s)")
         print(f" Email Alert  : {self.config.get('email', {}).get('recipient')}")
         print(f" Sound Alert  : Windows Speaker Alarm (winsound.Beep)")
+        power_mode_str = "Active (Dual-Layer: Kernel Lock + F15 Heartbeat)" if self.prevent_sleep else "Disabled (System default)"
+        print(f" Anti-Sleep   : {power_mode_str}")
         print("=" * 76)
         print(" Press Ctrl+C at any time to stop monitoring.\n")
 
     def run(self):
         self.print_banner()
 
+        if self.prevent_sleep:
+            prevent_windows_sleep()
+
+        try:
+            self._run_monitor_loop()
+        finally:
+            if self.prevent_sleep:
+                restore_windows_sleep()
+
+    def _run_monitor_loop(self):
         # Start input listener thread for stopping alarm
         input_thread = threading.Thread(target=self._listen_for_alarm_stop, daemon=True)
         input_thread.start()
 
-        date_idx = 0
+        target_idx = 0
         consecutive_errors = 0
 
         while self.running:
-            target_date = self.dates[date_idx % len(self.dates)]
-            date_idx += 1
+            if self.prevent_sleep:
+                prevent_windows_sleep()
+            target = self.targets[target_idx % len(self.targets)]
+            target_idx += 1
+            target_date = target["date"]
+            target_rules = target.get("rules")
+            if not target_rules:
+                target_rules = [{
+                    "trains": target.get("trains", ["ALL"]),
+                    "seat_classes": target.get("seat_classes", self.seat_classes)
+                }]
             self.stats["checks_count"] += 1
             now_str = datetime.now().strftime("%H:%M:%S")
 
-            # Default URL for manual access
-            default_class = "SNIGDHA" if self.seat_class.upper() in ["ALL", "ANY", ""] else self.seat_class
+            # Default URL for manual access (uses first target class, e.g. SNIGDHA)
+            default_class = "SNIGDHA"
+            if target_rules and target_rules[0].get("seat_classes"):
+                cand = str(target_rules[0]["seat_classes"][0]).strip().upper()
+                if cand not in ["ALL", "ANY", ""]:
+                    default_class = cand
+            elif self.seat_classes:
+                cand = str(self.seat_classes[0]).strip().upper()
+                if cand not in ["ALL", "ANY", ""]:
+                    default_class = cand
+
             booking_url = (
                 f"https://eticket.railway.gov.bd/booking/train/search"
                 f"?fromcity={self.from_city}&tocity={self.to_city}&doj={target_date}&class={default_class}"
@@ -206,8 +425,10 @@ class RailwayTicketMonitor:
                     from_city=self.from_city,
                     to_city=self.to_city,
                     date_of_journey=target_date,
-                    seat_class=self.seat_class,
-                    check_all_classes=self.check_all_classes
+                    seat_classes=self.seat_classes,
+                    seat_class=default_class,
+                    check_all_classes=self.check_all_classes,
+                    rules=target_rules
                 )
                 self.stats["last_latency_ms"] = latency
                 consecutive_errors = 0
@@ -267,11 +488,16 @@ class RailwayTicketMonitor:
                         f"{t['train_name'].split('(')[0].strip()}: 0"
                         for t in all_trains[:4]
                     ])
-                    target_class_label = "ALL SEATS" if self.check_all_classes or self.seat_class.upper() == "ALL" else self.seat_class
+                    rule_labels = []
+                    for r in target_rules:
+                        tr = "All" if "ALL" in [x.upper() for x in r.get("trains", ["ALL"])] else "/".join(r.get("trains", []))
+                        cl = "/".join(r.get("seat_classes", []))
+                        rule_labels.append(f"{tr}:[{cl}]")
+                    filter_summary = " & ".join(rule_labels)
                     print(
                         f"[{now_str}] Check #{self.stats['checks_count']:04d} | "
-                        f"{target_date} | {self.from_city}->{self.to_city} | "
-                        f"{latency:.0f}ms | Seats: 0 ({target_class_label}) | {train_summary}"
+                        f"{target_date} ({filter_summary}) | {self.from_city}->{self.to_city} | "
+                        f"{latency:.0f}ms | Seats: 0 | {train_summary}"
                     )
 
             except TokenExpiredError:
@@ -312,4 +538,6 @@ if __name__ == "__main__":
         monitor.run()
     except KeyboardInterrupt:
         print("\n[!] Monitoring stopped by user. Exiting gracefully.")
+    finally:
+        restore_windows_sleep()
         sys.exit(0)

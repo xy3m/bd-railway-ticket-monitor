@@ -19,6 +19,7 @@ It continuously queries the official ticketing API across target dates, checks f
 - **📧 Zero-Config Email Alerts:** Delivers formatted HTML alert emails with direct booking links via FormSubmit without requiring complex SMTP setup.
 - **💻 Windows Toast Notifications:** Pops up native Windows 10/11 notification banners.
 - **⏸️ Smart Auto-Pause:** Automatically pauses background polling for 60 seconds whenever tickets are found, ensuring 100% of your network connection and token quota is dedicated to loading your browser checkout.
+- **💤 Dual-Layer Anti-Sleep Lock:** Combines Windows kernel execution locks (`ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED`) with a background virtual idle-reset heartbeat (the Caffeine method). This prevents Windows 10/11 Modern Standby (S0) from suspending the process when the display dims or turns off.
 - **🛡️ Ethical & Rate-Limit Safe:** Includes human-like randomized jitter to protect your account and IP from rate-limit triggers.
 
 ---
@@ -59,17 +60,38 @@ Customize your route, dates, and alerts in `config.json`:
 {
   "from_city": "Sylhet",
   "to_city": "Dhaka",
-  "journey_dates": [
-    "26-Sep-2026",
-    "27-Sep-2026"
+  "journey_targets": [
+    {
+      "date": "11-Oct-2026",
+      "description": "11th October - Parabat Express & Upaban Express (All Seats)",
+      "rules": [
+        {
+          "trains": ["PARABAT EXPRESS", "UPABAN EXPRESS"],
+          "seat_classes": ["ALL"]
+        }
+      ]
+    },
+    {
+      "date": "12-Oct-2026",
+      "description": "12th October - Kalni Express & Jayentika Express (All Seats)",
+      "rules": [
+        {
+          "trains": ["KALNI EXPRESS", "JAYENTIKA EXPRESS"],
+          "seat_classes": ["ALL"]
+        }
+      ]
+    }
   ],
-  "seat_class": "ALL",
+  "seat_classes": [
+    "ALL"
+  ],
   "check_all_classes": true,
   "poll_interval_seconds": 2.5,
   "open_browser_on_alert": true,
+  "prevent_sleep": true,
   "email": {
     "enabled": true,
-    "recipient": "your_email@example.com"
+    "recipient": "abdullahomarsayeem@gmail.com"
   },
   "sound": {
     "enabled": true,
